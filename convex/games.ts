@@ -208,10 +208,12 @@ export const makeAction = mutation({
 
         const actionResult = await processPlayerAction(ctx, game, currentPlayer, players, args.action, args.amount);
 
+        // Correction : calculer le vrai betIncrease (pour éviter les incohérences)
+        const betIncrease = Math.max(0, actionResult.newBet - currentPlayer.currentBet);
         await ctx.db.patch(currentPlayer._id, {
             currentBet: actionResult.newBet,
-            totalBet: currentPlayer.totalBet + actionResult.betIncrease,
-            chips: currentPlayer.chips - actionResult.betIncrease,
+            totalBet: currentPlayer.totalBet + betIncrease,
+            chips: currentPlayer.chips - betIncrease,
             hasActed: true,
             action: args.action,
             isActive: actionResult.isActive,
@@ -239,8 +241,9 @@ export const makeAction = mutation({
             }
         }
 
+        // Correction : n'ajouter au pot que le vrai betIncrease
         await ctx.db.patch(args.gameId, {
-            pot: game.pot + actionResult.betIncrease,
+            pot: game.pot + betIncrease,
             updatedAt: Date.now(),
         });
 
@@ -441,19 +444,58 @@ async function advanceGameRound(ctx: any, gameId: string) {
         .withIndex("by_game", (q: any) => q.eq("gameId", gameId))
         .collect();
 
-    // Log avant d'ajouter les currentBet au pot
-    const totalBets = players.reduce((sum: number, p: any) => sum + (p.currentBet || 0), 0);
-    console.log('[DEBUG POT] Pot avant:', game.pot, 'TotalBets:', totalBets, 'Joueurs:', players.map((p: any) => ({ username: p.username, currentBet: p.currentBet })));
-    await ctx.db.patch(gameId, {
-        pot: (game.pot || 0) + totalBets,
-    });
-
+    // Reset des currentBet et hasActed
     for (const player of players) {
         await ctx.db.patch(player._id, {
             currentBet: 0,
             hasActed: false,
             action: undefined,
         });
+    }
+
+    // Gestion des cas limites
+    const activePlayers = players.filter((p: any) => p.isActive && !p.isAllIn);
+    const stillIn = players.filter((p: any) => p.isActive);
+    const allInPlayers = players.filter((p: any) => p.isActive && p.isAllIn);
+
+    // 1. Si un seul joueur actif reste (tous les autres ont fold), il gagne le pot immédiatement
+    if (activePlayers.length === 1 && stillIn.length >= 1) {
+        const winner = activePlayers[0];
+        await ctx.db.patch(winner._id, {
+            chips: winner.chips + game.pot,
+        });
+        await ctx.db.patch(gameId, {
+            status: "finished",
+            pot: 0,
+            updatedAt: Date.now(),
+        });
+        console.log('[SERVER] Un seul joueur actif, pot attribué à :', winner._id);
+        return;
+    }
+
+    // 2. Si tous les joueurs restants sont all-in, compléter le board jusqu'à 5 cartes puis showdown
+    if (activePlayers.length === 0 && allInPlayers.length > 0) {
+        let newDeck = [...game.deck];
+        let newCommunityCards = [...game.communityCards];
+        let newBurnedCards = [...game.burnedCards];
+        // Compléter le board jusqu'à 5 cartes
+        while (newCommunityCards.length < 5) {
+            newBurnedCards.push(newDeck.pop()!);
+            newCommunityCards.push(newDeck.pop()!);
+        }
+        await ctx.db.patch(gameId, {
+            communityCards: newCommunityCards,
+            burnedCards: newBurnedCards,
+            deck: newDeck,
+            updatedAt: Date.now(),
+        });
+        console.log('[SERVER] Tous les joueurs restants sont all-in, board complété, passage direct au showdown');
+        await handleShowdown(ctx, gameId, players, newCommunityCards);
+        await ctx.db.patch(gameId, {
+            currentRound: "showdown",
+            updatedAt: Date.now(),
+        });
+        return;
     }
 
     let newRound: string;
@@ -482,34 +524,46 @@ async function advanceGameRound(ctx: any, gameId: string) {
 
         case "river":
             newRound = "showdown";
+            // Compléter le board si besoin
+            while (newCommunityCards.length < 5) {
+                newBurnedCards.push(newDeck.pop()!);
+                newCommunityCards.push(newDeck.pop()!);
+            }
             console.log('[SERVER] Passage au showdown, appel de handleShowdown');
             await handleShowdown(ctx, gameId, players, newCommunityCards);
-            break;
+            await ctx.db.patch(gameId, {
+                currentRound: "showdown",
+                updatedAt: Date.now(),
+            });
+            return;
 
         default:
             return;
     }
 
-    const activePlayers = players.filter((p: any) => p.isActive && !p.isAllIn);
-    let firstPlayerIndex = (game.dealerIndex + 1) % players.length;
-
-    while (firstPlayerIndex !== game.dealerIndex) {
-        const player = players.find((p: any) => p.position === firstPlayerIndex);
-        if (player && player.isActive && !player.isAllIn) {
-            break;
+    if (newRound !== "showdown") {
+        // Calcul du premier joueur actif pour le nouveau round
+        let firstPlayerIndex = (game.dealerIndex + 1) % players.length;
+        let found = false;
+        for (let i = 0; i < players.length; i++) {
+            const idx = (firstPlayerIndex + i) % players.length;
+            const player = players.find((p: any) => p.position === idx);
+            if (player && player.isActive && !player.isAllIn) {
+                firstPlayerIndex = idx;
+                found = true;
+                break;
+            }
         }
-        firstPlayerIndex = (firstPlayerIndex + 1) % players.length;
+        await ctx.db.patch(gameId, {
+            currentRound: newRound,
+            currentPlayerIndex: found ? firstPlayerIndex : -1,
+            deck: newDeck,
+            communityCards: newCommunityCards,
+            burnedCards: newBurnedCards,
+            updatedAt: Date.now(),
+        });
+        console.log('[SERVER] Nouveau round :', newRound);
     }
-
-    await ctx.db.patch(gameId, {
-        currentRound: newRound,
-        currentPlayerIndex: newRound === "showdown" ? -1 : firstPlayerIndex,
-        deck: newDeck,
-        communityCards: newCommunityCards,
-        burnedCards: newBurnedCards,
-        updatedAt: Date.now(),
-    });
-    console.log('[SERVER] Nouveau round :', newRound);
 }
 
 // Fonction utilitaire robuste pour calculer les side pots selon la règle du poker
@@ -535,12 +589,29 @@ function calculateSidePots(players: Player[]): { amount: number; players: string
 
 // Nouvelle version de handleShowdown avec gestion stricte des side pots et split pot
 async function handleShowdown(ctx: any, gameId: string, players: any[], communityCards: string[]) {
+    // Compléter le board si besoin
+    let game = await ctx.db.get(gameId);
+    let newDeck = [...game.deck];
+    let newCommunityCards = [...communityCards];
+    let newBurnedCards = [...game.burnedCards];
+    while (newCommunityCards.length < 5) {
+        newBurnedCards.push(newDeck.pop()!);
+        newCommunityCards.push(newDeck.pop()!);
+    }
+    if (newCommunityCards.length !== game.communityCards.length) {
+        await ctx.db.patch(gameId, {
+            communityCards: newCommunityCards,
+            burnedCards: newBurnedCards,
+            deck: newDeck,
+            updatedAt: Date.now(),
+        });
+    }
     console.log('[SERVER] handleShowdown appelé, joueurs actifs :', players.filter((p: any) => p.isActive).map((p: any) => p._id));
     const activePlayers = players.filter((p: any) => p.isActive);
 
     if (activePlayers.length === 1) {
         const winner = activePlayers[0];
-        const game = await ctx.db.get(gameId);
+        game = await ctx.db.get(gameId);
         await ctx.db.patch(winner._id, {
             chips: winner.chips + game.pot,
         });
@@ -554,7 +625,7 @@ async function handleShowdown(ctx: any, gameId: string, players: any[], communit
     }
 
     // Calcul des side pots à partir des mises totales
-    const game = await ctx.db.get(gameId);
+    game = await ctx.db.get(gameId);
     const allPlayers: any[] = await ctx.db
         .query("players")
         .withIndex("by_game", (q: any) => q.eq("gameId", gameId))
@@ -565,9 +636,9 @@ async function handleShowdown(ctx: any, gameId: string, players: any[], communit
     const handRanks: { [id: string]: any } = {};
     for (const p of allPlayers) {
         if (p.isActive) {
-            const best = getBestHand(p.holeCards, communityCards);
+            const best = getBestHand(p.holeCards, newCommunityCards);
             handRanks[p._id] = best;
-            console.log('[SHOWDOWN DEBUG]', p.username, 'Cartes:', p.holeCards, 'Main:', best.rank, 'Valeur:', best.value, 'Communes:', communityCards);
+            console.log('[SHOWDOWN DEBUG]', p.username, 'Cartes:', p.holeCards, 'Main:', best.rank, 'Valeur:', best.value, 'Communes:', newCommunityCards);
         }
     }
 
@@ -598,22 +669,9 @@ async function handleShowdown(ctx: any, gameId: string, players: any[], communit
     await ctx.db.patch(gameId, {
         pot: 0,
         updatedAt: Date.now(),
+        // Correction : ne pas changer status ici, laisser "playing" pour permettre au front de démarrer la main suivante
     });
     console.log('[SERVER] Fin de handleShowdown, pot distribué');
-
-    // Vérifie s'il reste au moins 2 joueurs avec des jetons
-    const stillIn = allPlayers.filter((p: any) => p.chips > 0);
-    if (stillIn.length >= 2) {
-        // Démarre automatiquement la main suivante
-        console.log('[SERVER] Démarrage automatique de la nouvelle main');
-        await startNewHandHandler(ctx, { gameId });
-    } else {
-        // Partie terminée : un seul joueur a des jetons
-        await ctx.db.patch(gameId, {
-            status: "finished",
-        });
-        console.log('[SERVER] Partie terminée, un seul joueur a des jetons');
-    }
 }
 
 // Handler pur pour startNewHand
@@ -646,7 +704,7 @@ export async function startNewHandHandler(ctx: any, args: { gameId: string }) {
         currentRound: "preflop",
         deck: newDeck,
         burnedCards: [],
-        updatedAt: Date.now(),
+        updatedAt: Date.now(), // On ne touche qu'à la main, pas au chrono global
     });
 
     for (const player of players) {
